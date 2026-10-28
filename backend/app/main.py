@@ -1,8 +1,11 @@
 import os
+import secrets
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 
 from app.config import settings
 from app.database import engine, Base, SessionLocal
@@ -10,10 +13,8 @@ from app.models import Endpoint, ApiKey, SystemSetting
 from app.services.auth import hash_key
 from app.routers import admin, public_api
 
-from sqlalchemy import text
-
 def seed_initial_data():
-    """Seeds sample endpoints and default API key on first run."""
+    """Seeds sample endpoints and a secure random initial API key on first run."""
     db: Session = SessionLocal()
     try:
         # Check if endpoints exist
@@ -23,13 +24,14 @@ def seed_initial_data():
                 slug="general-assistant",
                 description="Fast multi-purpose conversational AI assistant",
                 is_active=True,
-                auth_required=False,
-                model_name="", # Auto-detect from LM Studio
+                auth_required=True, # Auth required by default for security
+                model_name="",
                 system_prompt="You are an intelligent, helpful, and concise AI assistant.",
                 temperature=0.7,
                 top_p=0.95,
                 max_tokens=2048,
-                stream_allowed=True
+                stream_allowed=True,
+                rate_limit_per_min=60
             )
             demo2 = Endpoint(
                 name="Code & Debugging Expert",
@@ -42,23 +44,32 @@ def seed_initial_data():
                 temperature=0.2,
                 top_p=0.9,
                 max_tokens=4096,
-                stream_allowed=True
+                stream_allowed=True,
+                rate_limit_per_min=60
             )
             db.add(demo1)
             db.add(demo2)
 
         # Check if API keys exist
         if db.query(ApiKey).count() == 0:
-            demo_raw_key = "ak_live_demo1234567890abcdef12345"
-            demo_key = ApiKey(
-                name="Default Development Key",
-                key_hash=hash_key(demo_raw_key),
-                key_prefix=demo_raw_key[:12] + "...",
-                raw_key=demo_raw_key,
+            # Generate a secure, unique random key instead of hardcoded demo credential
+            random_part = secrets.token_hex(20)
+            initial_raw_key = f"ak_live_{random_part}"
+            key_record = ApiKey(
+                name="Initial Development Key",
+                key_hash=hash_key(initial_raw_key),
+                key_prefix=initial_raw_key[:12] + "...",
+                raw_key=None, # Never persist plaintext secret
                 allowed_slugs="*",
                 is_active=True
             )
-            db.add(demo_key)
+            db.add(key_record)
+            
+            # Save initial key to local file only so operator can retrieve it
+            key_file = Path("./data/initial_dev_key.txt")
+            key_file.parent.mkdir(parents=True, exist_ok=True)
+            key_file.write_text(initial_raw_key, encoding="utf-8")
+            print(f"[SECURITY] Generated initial client API key saved to {key_file}")
 
         # Ensure LM Studio URL setting
         lm_url_setting = db.query(SystemSetting).filter(SystemSetting.key == "lm_studio_url").first()
@@ -78,12 +89,8 @@ async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
     with engine.connect() as conn:
         try:
-            result = conn.execute(text("PRAGMA table_info(api_keys)")).fetchall()
-            columns = [row[1] for row in result]
-            if "raw_key" not in columns:
-                conn.execute(text("ALTER TABLE api_keys ADD COLUMN raw_key VARCHAR(80) DEFAULT ''"))
-                conn.commit()
-            conn.execute(text("UPDATE api_keys SET raw_key = 'ak_live_demo1234567890abcdef12345' WHERE name = 'Default Development Key' AND (raw_key IS NULL OR raw_key = '')"))
+            # Scrub any existing plaintext keys from legacy databases
+            conn.execute(text("UPDATE api_keys SET raw_key = NULL WHERE raw_key IS NOT NULL"))
             conn.commit()
 
             ep_result = conn.execute(text("PRAGMA table_info(endpoints)")).fetchall()
@@ -91,12 +98,20 @@ async def lifespan(app: FastAPI):
             if "enable_reasoning" not in ep_columns:
                 conn.execute(text("ALTER TABLE endpoints ADD COLUMN enable_reasoning BOOLEAN DEFAULT 1"))
                 conn.commit()
+            if "rate_limit_per_min" not in ep_columns:
+                conn.execute(text("ALTER TABLE endpoints ADD COLUMN rate_limit_per_min INTEGER DEFAULT 60"))
+                conn.commit()
         except Exception:
             pass
 
     seed_initial_data()
+    print(f"\n=======================================================")
+    print(f" [LM STUDIO API GATEWAY SECURITY ACTIVE]")
+    print(f" Admin Key Location: ./data/admin_api_key.txt")
+    print(f" Max Concurrency:    {settings.MAX_CONCURRENT_INFERENCES}")
+    print(f" Rate Limiting:      Enabled (Sliding Window)")
+    print(f"=======================================================\n")
     yield
-    # Shutdown logic if any
 
 app = FastAPI(
     title="LM Studio API Gateway",
@@ -105,12 +120,12 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# Enable CORS for all clients
+# Enable CORS securely (without allow_credentials=True when allow_origins=["*"])
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -125,3 +140,4 @@ def health_check():
         "service": "LM Studio API Gateway",
         "version": "1.0.0"
     }
+

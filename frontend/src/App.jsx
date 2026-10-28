@@ -28,8 +28,77 @@ export default function App() {
   const [showCodeModal, setShowCodeModal] = useState(null);
   const [newlyCreatedEndpoint, setNewlyCreatedEndpoint] = useState(null);
 
-  // Revealed keys set for admin
-  const [revealedKeys, setRevealedKeys] = useState({});
+  // Admin authentication state
+  const [adminToken, setAdminToken] = useState(() => localStorage.getItem('lmstudio_admin_token') || '');
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [showAuthModal, setShowAuthModal] = useState(false);
+  const [authInputKey, setAuthInputKey] = useState('');
+  const [authError, setAuthError] = useState('');
+  const [isVerifyingAuth, setIsVerifyingAuth] = useState(false);
+
+  // Playground API key
+  const [playgroundApiKey, setPlaygroundApiKey] = useState(() => localStorage.getItem('lmstudio_playground_key') || '');
+
+  // Authenticated Admin Fetch helper
+  const adminFetch = async (url, options = {}) => {
+    const token = adminToken || localStorage.getItem('lmstudio_admin_token') || '';
+    const headers = {
+      ...(options.headers || {}),
+      'X-Admin-Key': token
+    };
+    try {
+      const res = await fetch(url, { ...options, headers });
+      if (res.status === 401) {
+        setIsAuthenticated(false);
+        setShowAuthModal(true);
+      }
+      return res;
+    } catch (err) {
+      throw err;
+    }
+  };
+
+  const verifyAdminToken = async (tokenToTest) => {
+    const token = tokenToTest !== undefined ? tokenToTest : (adminToken || localStorage.getItem('lmstudio_admin_token') || '');
+    if (!token) {
+      setIsAuthenticated(false);
+      setShowAuthModal(true);
+      return false;
+    }
+    setIsVerifyingAuth(true);
+    setAuthError('');
+    try {
+      const res = await fetch('/api/admin/auth/verify', {
+        headers: { 'X-Admin-Key': token }
+      });
+      if (res.ok) {
+        setIsAuthenticated(true);
+        setShowAuthModal(false);
+        setAdminToken(token);
+        localStorage.setItem('lmstudio_admin_token', token);
+        return true;
+      } else {
+        setIsAuthenticated(false);
+        setShowAuthModal(true);
+        setAuthError('Invalid Admin API Key. Check ./backend/data/admin_api_key.txt or your server logs.');
+        return false;
+      }
+    } catch (err) {
+      setAuthError('Could not reach API Gateway backend.');
+      return false;
+    } finally {
+      setIsVerifyingAuth(false);
+    }
+  };
+
+  const handleAdminLogout = () => {
+    localStorage.removeItem('lmstudio_admin_token');
+    setAdminToken('');
+    setIsAuthenticated(false);
+    setShowAuthModal(true);
+    setAuthInputKey('');
+    showToastMsg('Dashboard locked. Admin key cleared.');
+  };
 
   // Playground state
   const [selectedEndpointSlug, setSelectedEndpointSlug] = useState('');
@@ -98,13 +167,13 @@ export default function App() {
   const loadData = async () => {
     try {
       const [epRes, keysRes, logsRes, statsRes, lmRes, setRes, pubUrlRes] = await Promise.all([
-        fetch('/api/admin/endpoints'),
-        fetch('/api/admin/keys'),
-        fetch('/api/admin/logs?limit=50'),
-        fetch('/api/admin/stats'),
-        fetch('/api/admin/lmstudio/status'),
-        fetch('/api/admin/settings'),
-        fetch('/api/admin/public-url')
+        adminFetch('/api/admin/endpoints'),
+        adminFetch('/api/admin/keys'),
+        adminFetch('/api/admin/logs?limit=50'),
+        adminFetch('/api/admin/stats'),
+        adminFetch('/api/admin/lmstudio/status'),
+        adminFetch('/api/admin/settings'),
+        adminFetch('/api/admin/public-url')
       ]);
 
       if (epRes.ok) {
@@ -139,8 +208,19 @@ export default function App() {
   };
 
   useEffect(() => {
-    loadData();
-    const interval = setInterval(loadData, 8000);
+    const init = async () => {
+      const ok = await verifyAdminToken();
+      if (ok) {
+        loadData();
+      }
+    };
+    init();
+
+    const interval = setInterval(() => {
+      if (localStorage.getItem('lmstudio_admin_token')) {
+        loadData();
+      }
+    }, 8000);
     return () => clearInterval(interval);
   }, []);
 
@@ -148,7 +228,7 @@ export default function App() {
   const handleSavePublicUrl = async (e) => {
     if (e) e.preventDefault();
     try {
-      const res = await fetch('/api/admin/public-url', {
+      const res = await adminFetch('/api/admin/public-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ public_url: tempPublicUrl })
@@ -174,7 +254,7 @@ export default function App() {
         : '/api/admin/endpoints';
       const method = editingEndpoint ? 'PUT' : 'POST';
 
-      const res = await fetch(url, {
+      const res = await adminFetch(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(endpointForm)
@@ -247,7 +327,7 @@ export default function App() {
   const handleDeleteEndpoint = async (id, name) => {
     if (!confirm(`Are you sure you want to delete API '${name}'?`)) return;
     try {
-      await fetch(`/api/admin/endpoints/${id}`, { method: 'DELETE' });
+      await adminFetch(`/api/admin/endpoints/${id}`, { method: 'DELETE' });
       showToastMsg(`Endpoint '${name}' deleted`);
       loadData();
     } catch (err) {
@@ -257,7 +337,7 @@ export default function App() {
 
   const handleToggleEndpoint = async (id) => {
     try {
-      await fetch(`/api/admin/endpoints/${id}/toggle`, { method: 'POST' });
+      await adminFetch(`/api/admin/endpoints/${id}/toggle`, { method: 'POST' });
       loadData();
     } catch (err) {
       alert('Failed to toggle status');
@@ -268,7 +348,7 @@ export default function App() {
   const handleCreateKey = async (e) => {
     e.preventDefault();
     try {
-      const res = await fetch('/api/admin/keys', {
+      const res = await adminFetch('/api/admin/keys', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(keyForm)
@@ -276,6 +356,10 @@ export default function App() {
       if (!res.ok) throw new Error('Failed to create key');
       const data = await res.json();
       setNewKeyCreated(data);
+      if (data.raw_api_key) {
+        setPlaygroundApiKey(data.raw_api_key);
+        localStorage.setItem('lmstudio_playground_key', data.raw_api_key);
+      }
       setShowKeyModal(false);
       setKeyForm({ name: '', allowed_slugs: '*' });
       loadData();
@@ -287,7 +371,7 @@ export default function App() {
   const handleDeleteKey = async (id, name) => {
     if (!confirm(`Revoke API Key '${name}'? Any client using this key will be blocked.`)) return;
     try {
-      await fetch(`/api/admin/keys/${id}`, { method: 'DELETE' });
+      await adminFetch(`/api/admin/keys/${id}`, { method: 'DELETE' });
       showToastMsg('API Key revoked');
       loadData();
     } catch (err) {
@@ -297,7 +381,7 @@ export default function App() {
 
   const handleToggleKey = async (id) => {
     try {
-      await fetch(`/api/admin/keys/${id}/toggle`, { method: 'POST' });
+      await adminFetch(`/api/admin/keys/${id}/toggle`, { method: 'POST' });
       loadData();
     } catch (err) {
       alert('Failed to toggle key');
@@ -309,7 +393,7 @@ export default function App() {
     e.preventDefault();
     setUpdatingSettings(true);
     try {
-      const res = await fetch('/api/admin/settings/lm_studio_url', {
+      const res = await adminFetch('/api/admin/settings/lm_studio_url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ value: lmStudioUrl })
@@ -336,12 +420,14 @@ export default function App() {
     setTestMetrics(null);
 
     const startTime = performance.now();
-    const activeKey = apiKeys.find(k => k.is_active);
-    const keyToUse = activeKey ? (activeKey.raw_key || activeKey.key_prefix.replace('...', '')) : 'ak_live_demo1234567890abcdef12345';
+    const keyToUse = playgroundApiKey.trim() || localStorage.getItem('lmstudio_playground_key') || '';
 
     try {
       const headers = { 'Content-Type': 'application/json' };
       if (ep.auth_required) {
+        if (!keyToUse) {
+          throw new Error('API Key required for this endpoint. Please enter an active client API key.');
+        }
         headers['X-API-Key'] = keyToUse;
       }
 
@@ -452,8 +538,7 @@ export default function App() {
     const host = getActiveBaseUrl();
     const url = `${host}/api/v1/run/${ep.slug}`;
     const openAiUrl = `${host}/api/v1/run/${ep.slug}`;
-    const firstKey = apiKeys.find(k => k.is_active);
-    const keyVal = firstKey ? (firstKey.raw_key || 'YOUR_API_KEY') : 'YOUR_API_KEY';
+    const keyVal = playgroundApiKey || 'YOUR_API_KEY';
 
     return {
       python_requests: `import requests
@@ -598,8 +683,18 @@ func main() {
             </span>
           </div>
 
-          <button className="btn btn-secondary btn-sm" onClick={loadData} title="Refresh">
+          <button className="btn btn-secondary btn-sm" onClick={loadData} title="Refresh Data">
             <RefreshCw size={14} />
+          </button>
+
+          <button 
+            className="btn btn-secondary btn-sm" 
+            onClick={handleAdminLogout} 
+            title="Lock Dashboard (Clear Admin Key)"
+            style={{ display: 'flex', alignItems: 'center', gap: '6px', border: '1px solid rgba(245, 158, 11, 0.4)' }}
+          >
+            <Lock size={13} color="#f59e0b" />
+            <span style={{ fontSize: '0.78rem', color: '#f59e0b' }}>Lock</span>
           </button>
         </div>
       </header>
@@ -881,12 +976,29 @@ func main() {
           <div className="section-header">
             <div>
               <h2 className="section-title">Client API Keys</h2>
-              <p className="section-desc">You have full admin access. You can view, unhide, and copy any API key at any time.</p>
+              <p className="section-desc">Manage authentication keys for external applications. Keys are cryptographically hashed upon generation.</p>
             </div>
             <button className="btn btn-primary" onClick={() => setShowKeyModal(true)}>
               <Plus size={16} />
               <span>Generate New API Key</span>
             </button>
+          </div>
+
+          {/* Zero-Plaintext Security Notice */}
+          <div style={{
+            background: 'rgba(6, 182, 212, 0.08)',
+            border: '1px solid rgba(6, 182, 212, 0.25)',
+            borderRadius: 'var(--radius-sm)',
+            padding: '12px 16px',
+            marginBottom: '16px',
+            display: 'flex',
+            alignItems: 'center',
+            gap: '12px'
+          }}>
+            <Shield size={20} color="#06b6d4" />
+            <div style={{ fontSize: '0.84rem', color: '#e0f2fe' }}>
+              <strong>Zero-Plaintext Policy:</strong> Secret API keys are shown only once upon generation. The gateway database stores only SHA-256 hashes and key prefixes to ensure client credentials cannot be exposed even if the database is inspected.
+            </div>
           </div>
 
           <div className="panel-card">
@@ -903,7 +1015,7 @@ func main() {
                     <tr>
                       <th>Status</th>
                       <th>Key Name</th>
-                      <th>API Key Secret (Click eye to reveal anytime)</th>
+                      <th>Key Identifier (Prefix)</th>
                       <th>Permissions</th>
                       <th>Total Calls</th>
                       <th>Created Date</th>
@@ -912,9 +1024,6 @@ func main() {
                   </thead>
                   <tbody>
                     {apiKeys.map((k) => {
-                      const isRevealed = Boolean(revealedKeys[k.id]);
-                      const actualKey = k.raw_key || k.key_prefix;
-
                       return (
                         <tr key={k.id}>
                           <td>
@@ -929,41 +1038,30 @@ func main() {
                             </button>
                           </td>
                           <td style={{ fontWeight: 700, color: '#fff' }}>{k.name}</td>
-                          <td style={{ minWidth: '320px' }}>
+                          <td style={{ minWidth: '240px' }}>
                             <div style={{ 
-                              display: 'flex', 
+                              display: 'inline-flex', 
                               alignItems: 'center', 
                               gap: '8px',
                               background: 'rgba(0,0,0,0.5)',
-                              padding: '6px 12px',
+                              padding: '5px 10px',
                               borderRadius: 'var(--radius-sm)',
                               border: '1px solid rgba(255,255,255,0.08)'
                             }}>
                               <code style={{ 
-                                color: isRevealed ? '#34d399' : '#94a3b8', 
-                                fontSize: '0.86rem', 
-                                fontFamily: 'var(--font-mono)',
-                                letterSpacing: isRevealed ? 'normal' : '0.15em'
+                                color: '#38bdf8', 
+                                fontSize: '0.85rem', 
+                                fontFamily: 'var(--font-mono)' 
                               }}>
-                                {isRevealed ? actualKey : '••••••••••••••••••••••••••••••••'}
+                                {k.key_prefix}
                               </code>
-
                               <button 
                                 className="btn btn-secondary btn-sm"
-                                style={{ padding: '3px 8px' }}
-                                onClick={() => toggleKeyVisibility(k.id)}
-                                title={isRevealed ? "Hide key" : "Show full API key"}
+                                style={{ padding: '2px 6px' }}
+                                onClick={() => copyToClipboard(k.key_prefix, 'Key prefix copied!')}
+                                title="Copy Key Identifier"
                               >
-                                {isRevealed ? <EyeOff size={13} /> : <Eye size={13} />}
-                              </button>
-
-                              <button 
-                                className="btn btn-primary btn-sm"
-                                style={{ padding: '3px 10px', fontSize: '0.75rem', whiteSpace: 'nowrap' }}
-                                onClick={() => copyToClipboard(actualKey, 'API Key copied to clipboard!')}
-                                title="Copy API Key"
-                              >
-                                <Copy size={12} /> Copy
+                                <Copy size={11} />
                               </button>
                             </div>
                           </td>
@@ -1683,9 +1781,17 @@ func main() {
               <button className="close-btn" onClick={() => setNewKeyCreated(null)}>&times;</button>
             </div>
 
-            <p style={{ fontSize: '0.9rem', color: '#cbd5e1', marginBottom: 14 }}>
-              Here is your new API Key. You can also view, unhide, and copy it anytime in the <b>API Keys</b> tab!
-            </p>
+            <div style={{
+              background: 'rgba(239, 68, 68, 0.1)',
+              border: '1px solid rgba(239, 68, 68, 0.35)',
+              borderRadius: 'var(--radius-sm)',
+              padding: '12px 14px',
+              marginBottom: 16,
+              color: '#fca5a5',
+              fontSize: '0.84rem'
+            }}>
+              <strong>⚠️ Critical Security Notice:</strong> Please copy this secret API key immediately. For your security, raw API keys are never stored in the database and <strong>cannot be viewed again</strong>.
+            </div>
 
             <div style={{ 
               background: '#060911', 
@@ -1792,6 +1898,77 @@ func main() {
                 Done
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: ADMIN AUTHENTICATION */}
+      {showAuthModal && (
+        <div className="modal-overlay" style={{ zIndex: 9999, backdropFilter: 'blur(8px)', background: 'rgba(3, 7, 18, 0.85)' }}>
+          <div className="modal-content" style={{ maxWidth: '460px', border: '1px solid rgba(239, 68, 68, 0.4)' }} onClick={(e) => e.stopPropagation()}>
+            <div className="modal-header" style={{ borderBottom: '1px solid rgba(255,255,255,0.08)', paddingBottom: '14px' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                <div style={{ background: 'rgba(239, 68, 68, 0.15)', padding: '8px', borderRadius: '8px' }}>
+                  <Shield size={22} color="#ef4444" />
+                </div>
+                <div>
+                  <h3 className="modal-title" style={{ fontSize: '1.15rem' }}>Admin Access Required</h3>
+                  <p style={{ margin: 0, fontSize: '0.78rem', color: 'var(--text-muted)' }}>
+                    LM Studio AI Gateway Control Plane
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <p style={{ fontSize: '0.88rem', color: '#cbd5e1', marginTop: 14, marginBottom: 16 }}>
+              This gateway controls your local hardware inference endpoints. Please enter your administrator secret key to unlock the dashboard.
+            </p>
+
+            {authError && (
+              <div style={{
+                background: 'rgba(239, 68, 68, 0.15)',
+                border: '1px solid rgba(239, 68, 68, 0.35)',
+                borderRadius: 'var(--radius-sm)',
+                padding: '10px 14px',
+                color: '#fca5a5',
+                fontSize: '0.84rem',
+                marginBottom: 16
+              }}>
+                {authError}
+              </div>
+            )}
+
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              await verifyAdminToken(authInputKey);
+            }}>
+              <div className="form-group">
+                <label className="form-label">Administrator Master Key</label>
+                <input 
+                  type="password"
+                  className="form-input"
+                  placeholder="admin_sec_..."
+                  value={authInputKey}
+                  onChange={(e) => setAuthInputKey(e.target.value)}
+                  required
+                  autoFocus
+                />
+                <span className="form-hint" style={{ fontSize: '0.75rem', marginTop: '8px', display: 'block', color: 'var(--text-muted)' }}>
+                  🔑 Automatically generated in <code>backend/data/admin_api_key.txt</code> or configured via the <code>ADMIN_API_KEY</code> environment variable.
+                </span>
+              </div>
+
+              <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: 22 }}>
+                <button 
+                  type="submit" 
+                  className="btn btn-primary"
+                  disabled={isVerifyingAuth || !authInputKey.trim()}
+                  style={{ width: '100%', justifyContent: 'center', padding: '10px' }}
+                >
+                  {isVerifyingAuth ? 'Verifying Key...' : 'Unlock Dashboard'}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

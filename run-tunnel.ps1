@@ -43,10 +43,20 @@ while (!$process.HasExited) {
             try {
                 New-Item -ItemType Directory -Force -Path "$PSScriptRoot\backend\data" | Out-Null
                 Set-Content -Path "$PSScriptRoot\backend\data\public_url.txt" -Value $tunnelUrl
+                
+                $adminKey = ""
+                if (Test-Path "$PSScriptRoot\backend\data\admin_api_key.txt") {
+                    $adminKey = (Get-Content "$PSScriptRoot\backend\data\admin_api_key.txt" -Raw).Trim()
+                }
+                $headers = @{}
+                if ($adminKey) {
+                    $headers["X-Admin-Key"] = $adminKey
+                }
+
                 try {
-                    Invoke-RestMethod -Uri "http://127.0.0.1:$targetPort/api/admin/public-url" -Method POST -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
+                    Invoke-RestMethod -Uri "http://127.0.0.1:$targetPort/api/admin/public-url" -Method POST -Headers $headers -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
                 } catch {
-                    Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/admin/public-url" -Method POST -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
+                    Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/admin/public-url" -Method POST -Headers $headers -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
                 }
             } catch {}
         }

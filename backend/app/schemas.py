@@ -63,7 +63,6 @@ class ApiKeyResponse(BaseModel):
     id: str
     name: str
     key_prefix: str
-    raw_key: Optional[str] = ""
     is_active: bool
     allowed_slugs: str
     total_requests: int
@@ -72,6 +71,14 @@ class ApiKeyResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+# --- Admin Authentication Schemas ---
+class AdminLoginRequest(BaseModel):
+    admin_key: str = Field(..., min_length=1)
+
+class AdminAuthResponse(BaseModel):
+    authenticated: bool
+    message: str
 
 # --- Log Schemas ---
 class ApiLogResponse(BaseModel):

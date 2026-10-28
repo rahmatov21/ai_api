@@ -1,18 +1,32 @@
 import time
-from typing import Dict, Any, Optional
+import asyncio
+from typing import Dict, Any, Optional, AsyncGenerator
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.database import get_db
 from app.models import Endpoint, ApiLog
 from app.schemas import RunRequest, RunResponse
 from app.services.auth import validate_client_access
+from app.services.rate_limiter import rate_limiter
 from app.services.lm_studio import (
     build_messages, execute_chat_completion, execute_chat_stream
 )
 
 router = APIRouter(prefix="/api/v1/run", tags=["Public Manual APIs"])
+
+# Global semaphore to protect local GPU/CPU from concurrency overload
+inference_semaphore = asyncio.Semaphore(settings.MAX_CONCURRENT_INFERENCES)
+
+async def guarded_stream(generator: AsyncGenerator[str, None], semaphore: asyncio.Semaphore) -> AsyncGenerator[str, None]:
+    """Wraps streaming generator to ensure concurrency semaphore is always released on finish or disconnect."""
+    try:
+        async for chunk in generator:
+            yield chunk
+    finally:
+        semaphore.release()
 
 def log_api_call(
     db: Session,
@@ -57,6 +71,7 @@ def get_endpoint_info(slug: str, db: Session = Depends(get_db)):
         "auth_required": endpoint.auth_required,
         "model": endpoint.model_name or "LM Studio Auto",
         "stream_supported": endpoint.stream_allowed,
+        "rate_limit_per_min": endpoint.rate_limit_per_min,
         "endpoint_url": f"/api/v1/run/{slug}",
         "openai_compatible_url": f"/api/v1/run/{slug}/chat/completions"
     }
@@ -92,7 +107,19 @@ async def run_manual_api(
     api_key_record = validate_client_access(request, slug, endpoint.auth_required, db)
     key_name = api_key_record.name if api_key_record else None
 
-    # 3. Format Messages
+    # 3. Enforce Rate Limiting
+    limit = endpoint.rate_limit_per_min or settings.DEFAULT_RATE_LIMIT_PER_MIN
+    rate_identifier = f"{api_key_record.id if api_key_record else client_ip}:{slug}"
+    allowed, retry_after = rate_limiter.check_rate_limit(rate_identifier, limit)
+    if not allowed:
+        log_api_call(db, slug, key_name, client_ip, 429, 0, error="Rate limit exceeded")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded for endpoint '{slug}'. Limit: {limit} requests/min. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
+    # 4. Format Messages
     messages_payload = [m.model_dump() for m in payload.messages] if payload.messages else None
     messages = build_messages(
         endpoint=endpoint,
@@ -103,16 +130,25 @@ async def run_manual_api(
 
     should_stream = bool(payload.stream and endpoint.stream_allowed)
 
-    # 4. Handle Streaming Response
-    if should_stream:
-        # Increment request counter
-        endpoint.total_requests += 1
-        db.commit()
-
-        log_api_call(
-            db, slug, key_name, client_ip, 200, 0,
-            stream=True
+    # 5. Acquire Concurrency Semaphore
+    try:
+        await asyncio.wait_for(inference_semaphore.acquire(), timeout=10.0)
+    except asyncio.TimeoutError:
+        log_api_call(db, slug, key_name, client_ip, 503, 0, error="Concurrency limit reached")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Inference server busy: maximum concurrent generation requests reached. Please retry in a few moments."
         )
+
+    # 6. Handle Streaming Response
+    if should_stream:
+        endpoint.total_requests += 1
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+
+        log_api_call(db, slug, key_name, client_ip, 200, 0, stream=True)
 
         stream_payload = {
             "messages": messages,
@@ -125,8 +161,9 @@ async def run_manual_api(
             "reasoning_effort": payload.reasoning_effort
         }
 
+        stream_gen = execute_chat_stream(endpoint, stream_payload, db, request=request)
         return StreamingResponse(
-            execute_chat_stream(endpoint, stream_payload, db),
+            guarded_stream(stream_gen, inference_semaphore),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -134,7 +171,7 @@ async def run_manual_api(
             }
         )
 
-    # 5. Handle Standard Non-Streaming Response
+    # 7. Handle Standard Non-Streaming Response
     try:
         completion_payload = {
             "messages": messages,
@@ -152,7 +189,10 @@ async def run_manual_api(
 
         # Update endpoint stats
         endpoint.total_requests += 1
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
 
         # Log entry
         log_api_call(
@@ -193,6 +233,8 @@ async def run_manual_api(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Execution error: {str(e)}"
         )
+    finally:
+        inference_semaphore.release()
 
 @router.post("/{slug}/chat/completions")
 async def openai_compatible_chat(
@@ -201,11 +243,7 @@ async def openai_compatible_chat(
     request: Request,
     db: Session = Depends(get_db)
 ):
-    """
-    Drop-in OpenAI SDK compatible endpoint:
-    from openai import OpenAI
-    client = OpenAI(base_url="http://host/api/v1/run/<slug>", api_key="<key>")
-    """
+    """Drop-in OpenAI SDK compatible endpoint."""
     start_time = time.perf_counter()
     client_ip = request.client.host if request.client else "unknown"
 
@@ -219,6 +257,18 @@ async def openai_compatible_chat(
     api_key_record = validate_client_access(request, slug, endpoint.auth_required, db)
     key_name = api_key_record.name if api_key_record else None
 
+    # Enforce Rate Limiting
+    limit = endpoint.rate_limit_per_min or settings.DEFAULT_RATE_LIMIT_PER_MIN
+    rate_identifier = f"{api_key_record.id if api_key_record else client_ip}:{slug}"
+    allowed, retry_after = rate_limiter.check_rate_limit(rate_identifier, limit)
+    if not allowed:
+        log_api_call(db, slug, key_name, client_ip, 429, 0, error="Rate limit exceeded")
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded for endpoint '{slug}'. Limit: {limit} requests/min. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)}
+        )
+
     # System prompt injection if configured
     messages = payload.get("messages", [])
     if endpoint.system_prompt:
@@ -228,22 +278,37 @@ async def openai_compatible_chat(
 
     is_stream = bool(payload.get("stream", False) and endpoint.stream_allowed)
 
+    # Acquire Concurrency Semaphore
+    try:
+        await asyncio.wait_for(inference_semaphore.acquire(), timeout=10.0)
+    except asyncio.TimeoutError:
+        log_api_call(db, slug, key_name, client_ip, 503, 0, error="Concurrency limit reached")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Inference server busy: maximum concurrent generation requests reached. Please retry in a few moments."
+        )
+
     if is_stream:
         endpoint.total_requests += 1
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
         log_api_call(db, slug, key_name, client_ip, 200, 0, stream=True)
 
+        stream_gen = execute_chat_stream(endpoint, {
+            "messages": messages,
+            "model": endpoint.model_name or payload.get("model", ""),
+            "temperature": payload.get("temperature", endpoint.temperature),
+            "max_tokens": payload.get("max_tokens", endpoint.max_tokens),
+            "enable_reasoning": payload.get("enable_reasoning"),
+            "reasoning": payload.get("reasoning"),
+            "include_reasoning": payload.get("include_reasoning"),
+            "reasoning_effort": payload.get("reasoning_effort")
+        }, db, request=request)
+
         return StreamingResponse(
-            execute_chat_stream(endpoint, {
-                "messages": messages,
-                "model": endpoint.model_name or payload.get("model", ""),
-                "temperature": payload.get("temperature", endpoint.temperature),
-                "max_tokens": payload.get("max_tokens", endpoint.max_tokens),
-                "enable_reasoning": payload.get("enable_reasoning"),
-                "reasoning": payload.get("reasoning"),
-                "include_reasoning": payload.get("include_reasoning"),
-                "reasoning_effort": payload.get("reasoning_effort")
-            }, db),
+            guarded_stream(stream_gen, inference_semaphore),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
         )
@@ -262,7 +327,10 @@ async def openai_compatible_chat(
 
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         endpoint.total_requests += 1
-        db.commit()
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
 
         log_api_call(
             db=db,
@@ -275,9 +343,11 @@ async def openai_compatible_chat(
             completion_tokens=result.get("usage", {}).get("completion_tokens", 0)
         )
 
-        # Return standard OpenAI response shape
         return result.get("raw_response", result)
     except Exception as e:
         duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
         log_api_call(db, slug, key_name, client_ip, 500, duration_ms, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        inference_semaphore.release()
+

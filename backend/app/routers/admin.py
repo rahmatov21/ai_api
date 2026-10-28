@@ -1,20 +1,66 @@
+import secrets
+import ipaddress
+import urllib.parse
 from datetime import datetime
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 
+from app.config import settings
 from app.database import get_db
 from app.models import Endpoint, ApiKey, ApiLog, SystemSetting
 from app.schemas import (
     EndpointCreate, EndpointUpdate, EndpointResponse,
     ApiKeyCreate, ApiKeyResponse, ApiKeyCreatedResponse,
-    ApiLogResponse, LMStudioStatusResponse, SettingItem, SettingUpdate
+    ApiLogResponse, LMStudioStatusResponse, SettingItem, SettingUpdate,
+    AdminAuthResponse
 )
-from app.services.auth import generate_api_key
+from app.services.auth import generate_api_key, verify_admin_access
 from app.services.lm_studio import get_health_and_models, execute_chat_completion, get_lm_studio_base_url
 
-router = APIRouter(prefix="/api/admin", tags=["Admin Management"])
+router = APIRouter(
+    prefix="/api/admin",
+    tags=["Admin Management"],
+    dependencies=[Depends(verify_admin_access)]
+)
+
+def validate_target_url(url: str, param_name: str = "URL"):
+    """Validates URL format and blocks cloud metadata and hazardous IP ranges (SSRF prevention)."""
+    parsed = urllib.parse.urlparse(url.strip())
+    if parsed.scheme not in ("http", "https"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{param_name} must use http:// or https:// scheme."
+        )
+    hostname = parsed.hostname
+    if not hostname:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid hostname in {param_name}."
+        )
+    blocked_hosts = {"169.254.169.254", "metadata.google.internal", "metadata", "instance-data"}
+    if hostname.lower() in blocked_hosts:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Access to cloud metadata services is strictly prohibited."
+        )
+    try:
+        ip = ipaddress.ip_address(hostname)
+        if ip.is_link_local or ip.is_multicast:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Prohibited network address."
+            )
+    except ValueError:
+        pass
+
+# --- Admin Authentication Verification ---
+@router.get("/auth/verify", response_model=AdminAuthResponse)
+@router.post("/auth/verify", response_model=AdminAuthResponse)
+def verify_admin_credentials():
+    """Confirms validity of supplied Admin API Key."""
+    return AdminAuthResponse(authenticated=True, message="Admin credentials verified.")
 
 # --- Endpoints Management ---
 @router.get("/endpoints", response_model=List[EndpointResponse])
@@ -97,7 +143,7 @@ def create_api_key(payload: ApiKeyCreate, db: Session = Depends(get_db)):
         name=payload.name,
         key_hash=key_hash,
         key_prefix=key_prefix,
-        raw_key=raw_key,
+        raw_key=None, # Never persist raw secret in database
         allowed_slugs=payload.allowed_slugs or "*",
         is_active=True
     )
@@ -208,6 +254,9 @@ def get_settings(db: Session = Depends(get_db)):
 
 @router.post("/settings/{key}")
 def update_setting(key: str, payload: SettingUpdate, db: Session = Depends(get_db)):
+    if key == "lm_studio_url":
+        validate_target_url(payload.value, "LM Studio Base URL")
+
     setting = db.query(SystemSetting).filter(SystemSetting.key == key).first()
     if not setting:
         setting = SystemSetting(key=key, value=payload.value)
@@ -242,6 +291,8 @@ def get_public_url(db: Session = Depends(get_db)):
 @router.post("/public-url")
 def set_public_url(payload: Dict[str, str], db: Session = Depends(get_db)):
     url = (payload.get("public_url") or "").strip().rstrip("/")
+    if url:
+        validate_target_url(url, "Public Base URL")
     setting = db.query(SystemSetting).filter(SystemSetting.key == "public_base_url").first()
     if not setting:
         setting = SystemSetting(key="public_base_url", value=url)

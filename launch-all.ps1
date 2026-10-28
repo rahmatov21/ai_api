@@ -140,10 +140,20 @@ if ($tunnelUrlFound) {
     try {
         New-Item -ItemType Directory -Force -Path "$PSScriptRoot\backend\data" | Out-Null
         Set-Content -Path "$PSScriptRoot\backend\data\public_url.txt" -Value $tunnelUrl
+        
+        $adminKey = ""
+        if (Test-Path "$PSScriptRoot\backend\data\admin_api_key.txt") {
+            $adminKey = (Get-Content "$PSScriptRoot\backend\data\admin_api_key.txt" -Raw).Trim()
+        }
+        $headers = @{}
+        if ($adminKey) {
+            $headers["X-Admin-Key"] = $adminKey
+        }
+
         try {
-            Invoke-RestMethod -Uri "http://localhost/api/admin/public-url" -Method POST -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
+            Invoke-RestMethod -Uri "http://localhost/api/admin/public-url" -Method POST -Headers $headers -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
         } catch {
-            Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/admin/public-url" -Method POST -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
+            Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/admin/public-url" -Method POST -Headers $headers -Body (@{ public_url = $tunnelUrl } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 3 | Out-Null
         }
     } catch {}
 }
@@ -153,11 +163,16 @@ Start-Process "http://localhost"
 
 Write-Host ""
 Write-Host "==========================================================================" -ForegroundColor Green
-Write-Host "   LM STUDIO API GATEWAY - ALL SYSTEMS ONLINE & ACCESSIBLE WORLDWIDE!" -ForegroundColor Green
+Write-Host "   LM STUDIO API GATEWAY - ALL SYSTEMS ONLINE & SECURED!" -ForegroundColor Green
 Write-Host "==========================================================================" -ForegroundColor Green
 Write-Host "  * Local Web Dashboard:   http://localhost" -ForegroundColor White
 Write-Host "  * API Swagger Docs:      http://localhost/docs" -ForegroundColor White
+Write-Host "  * Admin Key File:        backend\data\admin_api_key.txt" -ForegroundColor White
 if ($tunnelUrlFound) {
+    Write-Host "  * GLOBAL WORLDWIDE LINK: $tunnelUrl" -ForegroundColor Yellow
+} else {
+    Write-Host "  * Tunnel: Generating link... check log below" -ForegroundColor Yellow
+}
     Write-Host "  * GLOBAL WORLDWIDE LINK: $tunnelUrl" -ForegroundColor Yellow
 } else {
     Write-Host "  * Tunnel: Generating link... check log below" -ForegroundColor Yellow

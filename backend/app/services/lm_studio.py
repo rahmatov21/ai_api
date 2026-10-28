@@ -3,6 +3,7 @@ import json
 import time
 import httpx
 from typing import AsyncGenerator, Dict, Any, List, Optional
+from fastapi import Request
 from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import SystemSetting, Endpoint
@@ -213,7 +214,8 @@ async def execute_chat_completion(
 async def execute_chat_stream(
     endpoint: Endpoint,
     payload: Dict[str, Any],
-    db: Session
+    db: Session,
+    request: Optional[Request] = None
 ) -> AsyncGenerator[str, None]:
     """Execute streaming chat completion against LM Studio and yield SSE chunks with reasoning control."""
     base_url = get_lm_studio_base_url(db)
@@ -256,6 +258,9 @@ async def execute_chat_stream(
                     return
 
                 async for line in response.aiter_lines():
+                    # Stop generation if client disconnected
+                    if request and await request.is_disconnected():
+                        break
                     if line:
                         if not is_reasoning_enabled:
                             if line.startswith("data: "):

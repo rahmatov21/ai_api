@@ -6,11 +6,13 @@ services:
     container_name: lmstudio_api_backend
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - LM_STUDIO_URL=http://host.docker.internal:1234/v1
       - DATABASE_URL=sqlite:///./data/gateway.db
       - REQUEST_TIMEOUT=180.0
+      - ADMIN_API_KEY=${ADMIN_API_KEY:-}
+      - MAX_CONCURRENT_INFERENCES=${MAX_CONCURRENT_INFERENCES:-2}
     extra_hosts:
       # Allows backend container to connect directly to LM Studio running on host machine
       - "host.docker.internal:host-gateway"

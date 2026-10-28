@@ -69,7 +69,7 @@ Make sure LM Studio is running on your machine with **Start Server** enabled on 
    - **Admin Dashboard**: [http://localhost](http://localhost)
    - **FastAPI Interactive Docs**: [http://localhost/docs](http://localhost/docs)
 
-*Note: In Docker, the backend connects to LM Studio via `http://host.docker.internal:1234/v1` automatically.*
+*Note: The platform is secured by default. The administrator secret key is generated automatically in `backend/data/admin_api_key.txt` (or set via `ADMIN_API_KEY` in `.env`). In Docker, the backend connects to LM Studio via `http://host.docker.internal:1234/v1` automatically.*
 
 ---
 
